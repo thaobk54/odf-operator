@@ -3,70 +3,142 @@ name: Build and Push Images for Release Branches
 on:
   push:
     branches:
-      - 'release-*'  # Trigger khi push đến branch release-*, bao gồm khi sync tạo branch mới
-  workflow_dispatch:  # Cho phép chạy manual nếu cần
+      - 'release-*'
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: write
+
+    env:
+      # Chọn engine: docker hoặc podman (mặc định docker). Có thể override bằng Repository Variables.
+      CONTAINER_ENGINE: ${{ vars.CONTAINER_ENGINE || 'docker' }}
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.ref }}  # Checkout branch hiện tại (release-*)
+          ref: ${{ github.ref }}
 
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.20'  # Dựa trên repo gốc; chỉnh nếu thay đổi
+          go-version: '1.20' # cập nhật nếu upstream thay đổi
 
-      - name: Install dependencies
+      - name: Install base deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y make git curl jq  # Cơ bản
-          # Install operator-sdk (version dựa trên repo gốc, ví dụ v1.33)
-          curl -LO https://github.com/operator-framework/operator-sdk/releases/download/v1.33.0/operator-sdk_linux_amd64
-          chmod +x operator-sdk_linux_amd64
-          sudo mv operator-sdk_linux_amd64 /usr/local/bin/operator-sdk
-          # Install opm (cho catalog)
-          curl -LO https://github.com/operator-framework/operator-package-manager/releases/download/v1.27.0/opm-v1.27.0-linux-amd64
-          chmod +x opm-v1.27.0-linux-amd64
-          sudo mv opm-v1.27.0-linux-amd64 /usr/local/bin/opm
-          # Install Docker (nếu chưa có)
-          sudo apt-get install -y docker.io
-          sudo systemctl start docker
+          sudo apt-get install -y make git curl jq rsync
 
-      - name: Docker login to registry
+      # Thiết lập môi trường theo engine đã chọn
+      - name: Detect and prepare container engine
+        id: engine
+        shell: bash
+        run: |
+          set -euo pipefail
+          ENGINE="${CONTAINER_ENGINE}"
+          echo "Requested engine: ${ENGINE}"
+
+          if [[ "${ENGINE}" == "docker" ]]; then
+            echo "Using Docker already available on GitHub runner."
+            docker version
+            docker info
+            echo "engine=docker" >> $GITHUB_OUTPUT
+          elif [[ "${ENGINE}" == "podman" ]]; then
+            echo "Installing Podman..."
+            # Cài podman ổn định từ apt
+            sudo apt-get update
+            sudo apt-get install -y podman
+            podman version
+            podman info
+
+            # Bật buildx qua docker-cli shim (podman cung cấp /usr/bin/docker trỏ podman)
+            # Makefile thường gọi 'docker build' -> shim của podman sẽ xử lý.
+            echo "engine=podman" >> $GITHUB_OUTPUT
+          else
+            echo "Unsupported CONTAINER_ENGINE=${ENGINE}. Use 'docker' or 'podman'."
+            exit 1
+          fi
+
+      # Thiết lập buildx. Với Docker dùng action chính thức, với Podman dùng shim.
+      - name: Set up Buildx (Docker)
+        if: steps.engine.outputs.engine == 'docker'
+        uses: docker/setup-buildx-action@v3
+        with:
+          install: true
+
+      - name: Login to registry (Docker)
+        if: steps.engine.outputs.engine == 'docker'
         uses: docker/login-action@v3
         with:
-          registry: ${{ secrets.REGISTRY_URL }}  # Ví dụ quay.io
+          registry: ${{ secrets.REGISTRY_URL }}
           username: ${{ secrets.QUAY_USERNAME }}
           password: ${{ secrets.QUAY_PASSWORD }}
 
+      - name: Login to registry (Podman)
+        if: steps.engine.outputs.engine == 'podman'
+        run: |
+          set -euo pipefail
+          REGISTRY="${{ secrets.REGISTRY_URL }}"
+          USER="${{ secrets.QUAY_USERNAME }}"
+          PASS="${{ secrets.QUAY_PASSWORD }}"
+          # Podman login
+          podman login "${REGISTRY}" -u "${USER}" -p "${PASS}"
+
+      - name: Install operator-sdk and opm
+        run: |
+          set -e
+          # operator-sdk
+          curl -sSL -o operator-sdk https://github.com/operator-framework/operator-sdk/releases/download/v1.33.0/operator-sdk_linux_amd64
+          chmod +x operator-sdk
+          sudo mv operator-sdk /usr/local/bin/operator-sdk
+          operator-sdk version || true
+
+          # opm (Operator Registry)
+          curl -sSL -o opm https://github.com/operator-framework/operator-registry/releases/download/v1.34.0/linux-amd64-opm
+          chmod +x opm
+          sudo mv opm /usr/local/bin/opm
+          opm version || true
+
       - name: Set environment variables
         run: |
-          # Extract IMAGE_TAG từ branch name, ví dụ release-4.19 -> 4.19
-          IMAGE_TAG=$(echo ${{ github.ref_name }} | sed 's/release-//')
+          IMAGE_TAG=$(echo "${{ github.ref_name }}" | sed 's/^release-//')
           echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
           echo "REGISTRY_NAMESPACE=${{ secrets.REGISTRY_NAMESPACE }}" >> $GITHUB_ENV
 
+      # Nếu Makefile hỗ trợ chọn engine qua biến, truyền CONTAINER_ENGINE để chắc chắn.
+      # Nếu Makefile gọi trực tiếp 'docker', Podman đã cung cấp docker-shim tương thích.
       - name: Build and push odf-operator image
+        env:
+          REGISTRY_NAMESPACE: ${{ env.REGISTRY_NAMESPACE }}
+          IMAGE_TAG: ${{ env.IMAGE_TAG }}
+          CONTAINER_ENGINE: ${{ env.CONTAINER_ENGINE }}
         run: |
-          export REGISTRY_NAMESPACE=${{ env.REGISTRY_NAMESPACE }}
-          export IMAGE_TAG=${{ env.IMAGE_TAG }}
-          make docker-build docker-push
+          echo "Building operator image with ${CONTAINER_ENGINE}"
+          make CONTAINER_ENGINE=${CONTAINER_ENGINE} docker-build docker-push
 
       - name: Build and push operator bundle image
+        env:
+          REGISTRY_NAMESPACE: ${{ env.REGISTRY_NAMESPACE }}
+          IMAGE_TAG: ${{ env.IMAGE_TAG }}
+          CONTAINER_ENGINE: ${{ env.CONTAINER_ENGINE }}
         run: |
-          export REGISTRY_NAMESPACE=${{ env.REGISTRY_NAMESPACE }}
-          export IMAGE_TAG=${{ env.IMAGE_TAG }}
-          make bundle-build bundle-push
+          echo "Building bundle image with ${CONTAINER_ENGINE}"
+          make CONTAINER_ENGINE=${CONTAINER_ENGINE} bundle-build bundle-push
 
       - name: Build and push operator catalog image
+        env:
+          REGISTRY_NAMESPACE: ${{ env.REGISTRY_NAMESPACE }}
+          IMAGE_TAG: ${{ env.IMAGE_TAG }}
+          CONTAINER_ENGINE: ${{ env.CONTAINER_ENGINE }}
         run: |
-          export REGISTRY_NAMESPACE=${{ env.REGISTRY_NAMESPACE }}
-          export IMAGE_TAG=${{ env.IMAGE_TAG }}
-          make catalog-build catalog-push
+          echo "Building catalog image with ${CONTAINER_ENGINE}"
+          make CONTAINER_ENGINE=${CONTAINER_ENGINE} catalog-build catalog-push
 
-      - name: Clean up
-        run: echo "Build completed for tag ${{ env.IMAGE_TAG }}"
+      - name: Done
+        run: echo "Build completed for tag ${{ env.IMAGE_TAG }} using ${{
+          env.CONTAINER_ENGINE }}"
