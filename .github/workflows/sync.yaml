@@ -1,0 +1,86 @@
+name: Sync Upstream Repo Daily
+
+on:
+  schedule:
+    - cron: '0 0 * * *'  # Hàng ngày lúc 00:00 UTC (chỉnh nếu cần)
+  workflow_dispatch:  # Cho phép chạy manual
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout target repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Fetch all history
+          token: ${{ secrets.GIT_PAT }}  # Sử dụng PAT để push sau
+
+      - name: Install rsync
+        run: sudo apt-get update && sudo apt-get install -y rsync
+
+      - name: Clone upstream repo
+        env:
+          UPSTREAM_REPO: https://github.com/red-hat-storage/odf-operator.git
+        run: |
+          git clone --bare $UPSTREAM_REPO upstream-mirror
+          cd upstream-mirror
+          git fetch --all
+          cd ..
+
+      - name: Get list of upstream branches
+        id: branches
+        run: |
+          BRANCHES=$(git -C upstream-mirror for-each-ref --format='%(refname:short)' refs/heads/)
+          echo "branches<<EOF" >> $GITHUB_OUTPUT
+          echo "$BRANCHES" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Sync each branch excluding .github/workflows
+        env:
+          GIT_PAT: ${{ secrets.GIT_PAT }}
+        run: |
+          # Thiết lập git config để commit
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          
+          # Thiết lập remote origin với PAT để push
+          git remote set-url origin https://x-access-token:${GIT_PAT}@github.com/thaobk54/odf-operator.git
+          
+          # Loop qua từng branch
+          for BRANCH in $(echo "${{ steps.branches.outputs.branches }}"); do
+            echo "Syncing branch: $BRANCH"
+            
+            # Checkout hoặc tạo branch trong target
+            git checkout $BRANCH || git checkout -b $BRANCH
+            
+            # Checkout branch tương ứng trong upstream-mirror và copy files
+            mkdir -p temp-upstream
+            git -C upstream-mirror archive $BRANCH | tar -x -C temp-upstream
+            
+            # Sử dụng rsync để sync files, exclude .github/workflows/, và delete files không tồn tại ở upstream
+            rsync -a --delete --exclude='.github/workflows/' temp-upstream/ ./
+            
+            # Clean temp
+            rm -rf temp-upstream
+            
+            # Add all changes
+            git add -A
+            
+            # Commit nếu có thay đổi
+            if ! git diff --cached --quiet; then
+              git commit -m "Sync branch $BRANCH from upstream (excluding .github/workflows)"
+              git push origin $BRANCH
+            else
+              echo "No changes in $BRANCH, skipping commit/push"
+            fi
+          done
+
+      - name: Sync tags
+        run: |
+          git fetch upstream-mirror 'refs/tags/*:refs/tags/*'
+          git push origin --tags
+
+      - name: Clean up
+        run: |
+          rm -rf upstream-mirror
+          echo "Sync completed"
