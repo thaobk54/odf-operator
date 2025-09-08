@@ -39,7 +39,7 @@ jobs:
     name: Build ${{ matrix.branch }}
     needs: discover-branches
     runs-on: ubuntu-latest
-    if: ${{ fromJson(needs.discover-branches.outputs.matrix) != null && (fromJson(needs.discover-branches.outputs.matrix) | length) > 0 }}
+    if: ${{ fromJson(needs.discover-branches.outputs.matrix) && fromJson(needs.discover-branches.outputs.matrix).length > 0 }}
     strategy:
       fail-fast: false
       matrix:
