@@ -1,30 +1,67 @@
-name: Build and Push Images for Release Branches
+name: Build and Push Images for release-4.x branches
 
 on:
-  push:
-    branches:
-      - 'release-*'
   workflow_dispatch:
+  schedule:
+    - cron: '0 1 * * *' # chạy hàng ngày lúc 01:00 UTC
 
 jobs:
-  build:
+  discover-branches:
+    name: Discover release-4.x branches
     runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Checkout (workflow branch)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch all branches
+        run: |
+          git fetch --all --prune
+
+      - name: Collect release-4.x branches
+        id: set-matrix
+        run: |
+          set -euo pipefail
+          # Lấy các branch dạng release-4.x (ví dụ release-4.8, release-4.19)
+          BRANCHES=$(git for-each-ref --format='%(refname:short)' refs/remotes/origin/ \
+            | sed 's#^origin/##' \
+            | sort -u \
+            | grep -E '^release-4\.[0-9]+ || true)
+          echo "Found branches:"
+          echo "${BRANCHES}"
+          JSON=$(printf '%s\n' "${BRANCHES}" | jq -Rcs 'split("\n") | map(select(length>0))')
+          echo "matrix=${JSON}" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.branch }}
+    needs: discover-branches
+    runs-on: ubuntu-latest
+    if: ${{ fromJson(needs.discover-branches.outputs.matrix) != null && (fromJson(needs.discover-branches.outputs.matrix) | length) > 0 }}
+    strategy:
+      fail-fast: false
+      matrix:
+        branch: ${{ fromJson(needs.discover-branches.outputs.matrix) }}
 
     permissions:
       contents: read
       packages: write
 
     env:
-      # Chọn engine: docker hoặc podman (mặc định docker). Có thể override bằng repository variable CONTAINER_ENGINE.
+      # docker hoặc podman (mặc định docker). Không cài containerd.
       CONTAINER_ENGINE: ${{ vars.CONTAINER_ENGINE || 'docker' }}
+      # Với yêu cầu của bạn, ta dùng --load để Makefile có thể `docker push` bình thường
+      BUILD_PLATFORMS: linux/amd64
 
     steps:
-      - name: Checkout code
+      - name: Checkout target branch
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.ref }}
+          ref: ${{ matrix.branch }}
+          fetch-depth: 0
 
-      # 1) Đọc version Go từ go.mod và chuẩn hóa 1.X.Y -> 1.X
       - name: Detect and normalize Go version from go.mod
         id: gover
         shell: bash
@@ -34,32 +71,37 @@ jobs:
             echo "go.mod not found at repo root." >&2
             exit 1
           fi
-
           RAW=$(awk '/^go[[:space:]]+[0-9]+(\.[0-9]+){1,2}/{print $2; exit}' go.mod || true)
           if [[ -z "${RAW}" ]]; then
             echo "No 'go' directive found in go.mod." >&2
             exit 1
           fi
-
-          # Chuẩn hóa: chỉ giữ major.minor
-          NORMALIZED=$(echo "${RAW}" | awk -F. '{print $1"."$2}')
+          NORM=$(echo "${RAW}" | awk -F. '{print $1"."$2}')
           echo "raw_go=${RAW}" >> $GITHUB_OUTPUT
-          echo "go=${NORMALIZED}" >> $GITHUB_OUTPUT
-          echo "Detected go version in go.mod: raw=${RAW}, normalized=${NORMALIZED}"
+          echo "go=${NORM}" >> $GITHUB_OUTPUT
+          echo "Detected go version in go.mod: raw=${RAW}, normalized=${NORM}"
 
-      # 2) Setup Go đúng phiên bản
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
           go-version: ${{ steps.gover.outputs.go }}
           check-latest: true
 
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: gomod-${{ runner.os }}-${{ steps.gover.outputs.go }}-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            gomod-${{ runner.os }}-${{ steps.gover.outputs.go }}-
+
       - name: Install base deps
         run: |
           sudo apt-get update
           sudo apt-get install -y make git curl jq rsync
 
-      # 3) Ghi đè dòng 'go' trong go.mod về dạng chuẩn trước khi tidy/vendor
       - name: Normalize go directive in go.mod (strip patch if present)
         shell: bash
         run: |
@@ -68,9 +110,7 @@ jobs:
           NORM="${{ steps.gover.outputs.go }}"
           if [[ "${RAW}" != "${NORM}" ]]; then
             echo "Normalizing go.mod from 'go ${RAW}' to 'go ${NORM}'"
-            # Thay thế chính xác dòng bắt đầu bằng 'go ' chứa RAW
             sed -i -E "s/^go[[:space:]]+${RAW}$/go ${NORM}/" go.mod || true
-            # Fallback nếu whitespace khác nhau
             if ! grep -qE "^go[[:space:]]+${NORM}$" go.mod; then
               awk -v norm="${NORM}" '
                 BEGIN{done=0}
@@ -83,7 +123,6 @@ jobs:
             echo "go.mod already normalized to ${NORM}"
           fi
 
-      # 4) Chuẩn bị engine: Docker hoặc Podman (không cài containerd)
       - name: Detect and prepare container engine
         id: engine
         shell: bash
@@ -91,7 +130,6 @@ jobs:
           set -euo pipefail
           ENGINE="${CONTAINER_ENGINE}"
           echo "Requested engine: ${ENGINE}"
-
           if [[ "${ENGINE}" == "docker" ]]; then
             docker version
             docker info
@@ -112,6 +150,8 @@ jobs:
         uses: docker/setup-buildx-action@v3
         with:
           install: true
+          driver-opts: |
+            image=moby/buildkit:latest
 
       - name: Login to registry (Docker)
         if: steps.engine.outputs.engine == 'docker'
@@ -127,50 +167,88 @@ jobs:
           set -euo pipefail
           podman login "${{ secrets.REGISTRY_URL }}" -u "${{ secrets.QUAY_USERNAME }}" -p "${{ secrets.QUAY_PASSWORD }}"
 
+      - name: Prepare buildx --load wrapper (no Makefile changes)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ~/bin
+          # Wrapper cho 'docker buildx build' → tự động thêm --load
+          cat > ~/bin/docker <<'EOF'
+          #!/usr/bin/env bash
+          # Wrapper cho docker để ép buildx build dùng --load nếu chưa có --push/--load
+          if [[ "$1" == "buildx" && "$2" == "build" ]]; then
+            # nếu chưa có --push hoặc --load thì thêm --load
+            for a in "$@"; do
+              if [[ "$a" == "--push" || "$a" == "--load" ]]; then
+                exec /usr/bin/docker "$@"
+              fi
+            done
+            exec /usr/bin/docker "$@" --load
+          else
+            exec /usr/bin/docker "$@"
+          fi
+          EOF
+          chmod +x ~/bin/docker
+          echo "$HOME/bin" >> $GITHUB_PATH
+          which docker
+          docker buildx version || true
+
       - name: Install operator-sdk and opm
         run: |
           set -e
-          # operator-sdk
           curl -sSL -o operator-sdk https://github.com/operator-framework/operator-sdk/releases/download/v1.33.0/operator-sdk_linux_amd64
           chmod +x operator-sdk && sudo mv operator-sdk /usr/local/bin/operator-sdk
           operator-sdk version || true
-          # opm (Operator Registry)
           curl -sSL -o opm https://github.com/operator-framework/operator-registry/releases/download/v1.34.0/linux-amd64-opm
           chmod +x opm && sudo mv opm /usr/local/bin/opm
           opm version || true
 
       - name: Set image variables
+        shell: bash
         run: |
-          IMAGE_TAG=$(echo "${{ github.ref_name }}" | sed 's/^release-//')
+          BR="${{ matrix.branch }}"
+          # Tag: release-4.19 -> 4.19
+          if [[ "${BR}" =~ ^release-([0-9]+\.[0-9]+)$ ]]; then
+            IMAGE_TAG="${BASH_REMATCH[1]}"
+          else
+            IMAGE_TAG="${BR}"
+          fi
           echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
           echo "REGISTRY_NAMESPACE=${{ secrets.REGISTRY_NAMESPACE }}" >> $GITHUB_ENV
+          echo "Resolved IMAGE_TAG=$IMAGE_TAG"
 
-      - name: Build and push odf-operator image
+      - name: Build and push operator image (uses buildx --load via wrapper)
         env:
           REGISTRY_NAMESPACE: ${{ env.REGISTRY_NAMESPACE }}
           IMAGE_TAG: ${{ env.IMAGE_TAG }}
-          CONTAINER_ENGINE: ${{ env.CONTAINER_ENGINE }}
+          CONTAINER_ENGINE: docker
+          BUILD_PLATFORMS: ${{ env.BUILD_PLATFORMS }}
         run: |
-          echo "Building operator image with ${CONTAINER_ENGINE}"
-          make CONTAINER_ENGINE=${CONTAINER_ENGINE} docker-build docker-push
+          echo "Building operator image with docker (buildx --load wrapper)"
+          make CONTAINER_ENGINE=docker docker-build
+          echo "Pushing operator image"
+          make CONTAINER_ENGINE=docker docker-push
 
-      - name: Build and push operator bundle image
+      - name: Build and push operator bundle image (uses buildx --load via wrapper)
         env:
           REGISTRY_NAMESPACE: ${{ env.REGISTRY_NAMESPACE }}
           IMAGE_TAG: ${{ env.IMAGE_TAG }}
-          CONTAINER_ENGINE: ${{ env.CONTAINER_ENGINE }}
+          CONTAINER_ENGINE: docker
+          BUILD_PLATFORMS: ${{ env.BUILD_PLATFORMS }}
         run: |
-          echo "Building bundle image with ${CONTAINER_ENGINE}"
-          make CONTAINER_ENGINE=${CONTAINER_ENGINE} bundle-build bundle-push
+          echo "Building bundle image with docker (buildx --load wrapper)"
+          make CONTAINER_ENGINE=docker bundle-build
+          echo "Pushing bundle image"
+          make CONTAINER_ENGINE=docker bundle-push
 
-      - name: Build and push operator catalog image
+      - name: Build and push operator catalog image (uses buildx --load via wrapper)
         env:
           REGISTRY_NAMESPACE: ${{ env.REGISTRY_NAMESPACE }}
           IMAGE_TAG: ${{ env.IMAGE_TAG }}
-          CONTAINER_ENGINE: ${{ env.CONTAINER_ENGINE }}
+          CONTAINER_ENGINE: docker
+          BUILD_PLATFORMS: ${{ env.BUILD_PLATFORMS }}
         run: |
-          echo "Building catalog image with ${CONTAINER_ENGINE}"
-          make CONTAINER_ENGINE=${CONTAINER_ENGINE} catalog-build catalog-push
-
-      - name: Done
-        run: echo "Build completed for tag ${{ env.IMAGE_TAG }} using ${{ env.CONTAINER_ENGINE }}"
+          echo "Building catalog image with docker (buildx --load wrapper)"
+          make CONTAINER_ENGINE=docker catalog-build
+          echo "Pushing catalog image"
+          make CONTAINER_ENGINE=docker catalog-push
